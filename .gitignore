@@ -1,0 +1,49 @@
+# Virtual Environments
+.venv/
+venv/
+env/
+bin/
+lib/
+share/
+Include/
+
+# Python internal
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.env.local
+
+# AI Models (Өте ауыр файлдар - GitHub қабылдамайды)
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.h5
+*.ckpt
+backend/models/truthlens_en_model/
+backend/models/truthlens_kk_model/
+results/
+checkpoint-*/
+
+# Database
+*.db
+*.sqlite3
+
+# Datasets & Reports
+*.csv
+*.jsonl
+*.txt
+*.log
+
+# Frontend / Node
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+build/
+.next/
+
+# OS files
+.DS_Store
+Thumbs.db
