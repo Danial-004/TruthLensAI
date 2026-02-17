@@ -27,3 +27,4 @@ slowapi
 redis
 feedparser
 schedule
+google-generativeai
