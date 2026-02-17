@@ -61,3 +61,6 @@ slowapi==0.1.9
 
 # Caching
 redis==5.1.1
+feedparser
+python-multipart
+schedule
