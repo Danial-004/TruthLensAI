@@ -9,7 +9,7 @@ python-multipart==0.0.6
 fastapi-cors==0.0.6
 
 # Machine Learning & NLP
-torch==2.3.0
+torch==2.9.0
 transformers==4.57.1
 sentence-transformers==3.0.1
 tokenizers==0.22.1
