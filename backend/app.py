@@ -54,13 +54,18 @@ URL_DOWNLOAD_TIMEOUT = 10 # 10 секунд
 origins = [
     "http://localhost:3000",
     "http://localhost:5173",
+    "https://truthlens-ai-one.vercel.app",  # <--- ЕҢ МАҢЫЗДЫСЫ ОСЫ (соңында /slash болмасын)
 ]
+
+# 2. Render-ден келген қосымша сілтемелерді қосамыз
 env_origins = os.getenv("CORS_ORIGINS")
 if env_origins:
     origins.extend(env_origins.split(","))
+
+# 3. Middleware-ді дұрыс баптаймыз
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=origins,    # <--- Жұлдызша емес, 'origins' тізімін береміз!
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
