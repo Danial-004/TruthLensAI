@@ -2,11 +2,11 @@ fastapi
 uvicorn[standard]
 python-multipart
 fastapi-cors
-torch
-transformers
-sentence-transformers
-numpy
-pandas
+#torch
+#transformers
+#sentence-transformers
+#numpy
+#pandas
 requests
 beautifulsoup4
 sqlalchemy

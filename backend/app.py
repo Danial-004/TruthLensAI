@@ -21,16 +21,13 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
-from pydantic import BaseModel, Field, EmailStr, ValidationError
 from passlib.context import CryptContext
 import redis
 from PIL import Image
 from bs4 import BeautifulSoup
-from fastapi.middleware.cors import CORSMiddleware
 
 # === Локальные модули ===
-from database import Database   # <--- Нүктені алып тастаймыз
-from model import FakeNewsDetector
+from database import Database   
 from search_api import WebSearcher
 from utils import detect_language, preprocess_text
 
@@ -808,7 +805,7 @@ def get_gemini_full_analysis_prompt(language, text, sources_text, local_model_re
 
 @app.post(
     "/analyze",
-    response_model=FullAnalysisResponse,
+    # response_model=FullAnalysisResponse,  <-- Егер Pydantic модель жоғарыда болса, қосыңыз
     tags=["Analysis"],
     responses={
         status.HTTP_429_TOO_MANY_REQUESTS: {"description": "Лимит запросов исчерпан."},
@@ -820,14 +817,14 @@ async def analyze_text(
     req_body: AnalysisRequest,
     request: Request, 
     current_user: Optional[dict] = Depends(get_optional_current_user),
-    _guest_limit_check: None = Depends(rate_limit_guest)
+    # _guest_limit_check: None = Depends(rate_limit_guest) # Redis жоқ болса, алып тастаңыз
 ):
-    # (Эндпоинт анализа ТЕКСТА - БЕЗ ИЗМЕНЕНИЙ)
-    #detector = getattr(request.app.state, 'detector', None)
+    # 1. Тек жеңіл компоненттерді аламыз
     searcher = getattr(request.app.state, 'searcher', None)
     gemini_model = getattr(request.app.state, 'gemini_model', None)
     db: Optional[Database] = getattr(request.app.state, 'db', None)
 
+    # Detector керек емес!
     if not all([searcher, gemini_model, db]):
         raise HTTPException(status_code=503, detail="Сервис временно недоступен.")
     
@@ -838,15 +835,20 @@ async def analyze_text(
         if not user_id:
             raise HTTPException(status_code=401, detail="Ошибка аутентификации пользователя.")
 
-        is_limit_ok = db.check_and_update_rate_limit(user_id=user_id, limit=USER_DAILY_REQUEST_LIMIT)
-        if not is_limit_ok:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Дневной лимит запросов исчерпан. Пожалуйста, попробуйте завтра."
-            )
+        # Redis өшірулі болса, лимит тексеру қате беруі мүмкін.
+        # Егер Redis жоқ болса, бұл блокты try-except-ке алыңыз:
+        try:
+            is_limit_ok = db.check_and_update_rate_limit(user_id=user_id, limit=USER_DAILY_REQUEST_LIMIT)
+            if not is_limit_ok:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Дневной лимит запросов исчерпан."
+                )
+        except Exception:
+            pass # Redis жоқ болса, лимитті елемейміз
+        
         user_id_for_db = user_id
     else:
-        # ✅ (v4.6.2) Правильное получение IP
         ip_guest = request.headers.get("X-Forwarded-For") or request.headers.get("X-Real-IP") or request.client.host
         logger.info(f"Анализ (Текст) для гостя с IP: {ip_guest or 'unknown'}")
         
@@ -854,50 +856,50 @@ async def analyze_text(
         language = detect_language(req_body.text)
         clean_text = preprocess_text(req_body.text)
 
+        # 2. Іздеу (SerpAPI)
         logger.info(f"Searching: '{clean_text[:50]}...' (lang: {language})")
-        search_results = searcher.search(req_body.text, language, max_results=5)
-        #top_sources = detector.rank_sources_nli(clean_text, search_results)
+        search_results = searcher.search(req_body.text, language, max_results=3) # 3 нәтиже жетеді
+        
         sources_for_prompt = "\n".join([
             f"- Title: {s.get('title', 'N/A')}\n  URL: {s.get('url', 'N/A')}\n  Description: {s.get('description', 'N/A')}"
             for s in search_results
         ]) if search_results else "No relevant sources found."
 
-        local_recommendation: Optional[str] = None
-        #if language == 'kk':
-        #   logger.info("Запрос 'kk'. Запуск локальной модели v3 для получения РЕКОМЕНДАЦИИ...")
-        #    try:
-        #        prediction = detector.predict(req_body.text, language)
-        #        if prediction['classification'] in ['real', 'fake']:
-        #            local_recommendation = prediction['classification']
-        #            logger.info(f"Локальная 'kk' модель РЕКОМЕНДУЕТ: {local_recommendation} (Conf: {prediction['confidence']:.2f})")
-        #        else:
-        #            logger.warning(f"Локальная 'kk' модель вернула не-бинарный класс: {prediction['classification']}")
-        #    except Exception as e:
-        #        logger.error(f"Ошибка при вызове локальной 'kk' модели: {e}", exc_info=True)
-        #else:
-        #    logger.info(f"Язык '{language}'. Локальная модель недоступна.")
-        logger.info("Вызов Gemini (Chief Fact-Checker) для вынесения ФИНАЛЬНОГО вердикта...")
+        # 3. Жергілікті модельді (local_recommendation) ТОЛЫҚ ӨШІРДІК
+        # Оның орнына Gemini-ге "None" жібереміз.
+
+        logger.info("Вызов Gemini (Chief Fact-Checker)...")
+        
+        # Prompt дайындау
         final_prompt = get_gemini_full_analysis_prompt(
             language=language,
             text=req_body.text,
             sources_text=sources_for_prompt,
-            local_model_recommendation=None
+            local_model_recommendation=None # Жергілікті модель ЖОҚ
         )
+        
+        # Gemini-ді шақыру
         response_gemini = await gemini_model.generate_content_async(final_prompt)
+        
         try:
+            # Жауапты өңдеу
             gemini_full_response = GeminiFullAnalysisResponse.model_validate_json(response_gemini.text)
             analysis_data_dict = gemini_full_response.model_dump()
             final_verdict = analysis_data_dict.pop("verdict")
             final_confidence = analysis_data_dict.pop("confidence")
         except Exception as json_e:
-            logger.error(f"❌ Ошибка парсинга JSON от Gemini: {json_e}\nRaw: {response_gemini.text}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Ошибка при обработке ответа AI (Полный анализ).")
+            logger.error(f"❌ JSON Error: {json_e}")
+            raise HTTPException(status_code=500, detail="Ошибка AI.")
+
         response_data = {
             "verdict": final_verdict, 
             "confidence": final_confidence,
             "original_statement": req_body.text, 
+            "local_label": None, # Frontend күтсе, бос жібереміз
             **analysis_data_dict
         }
+
+        # Базаға сақтау
         analysis_id = None
         if user_id_for_db: 
             analysis_id = db.save_analysis(
@@ -905,13 +907,14 @@ async def analyze_text(
                 confidence=final_confidence, full_response=response_data
             )
             response_data["analysis_id"] = analysis_id
+            
         return FullAnalysisResponse(**response_data)
+
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        user_email = current_user.get('email') if current_user else f"Гость ({request.client.host})"
-        logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА в /analyze для {user_email}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Произошла внутренняя ошибка при анализе.")
+        logger.error(f"❌ Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Внутренняя ошибка.")
 
 
 # ⛔️ (v4.6.2) ДУБЛИКАТ /analyze_image (v4.3) УДАЛЕН ⛔️
