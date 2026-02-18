@@ -26,6 +26,7 @@ from passlib.context import CryptContext
 import redis
 from PIL import Image
 from bs4 import BeautifulSoup
+from fastapi.middleware.cors import CORSMiddleware
 
 # === Локальные модули ===
 from database import Database   # <--- Нүктені алып тастаймыз
@@ -60,13 +61,16 @@ origins = [
 # 2. Render-ден келген қосымша сілтемелерді қосамыз
 env_origins = os.getenv("CORS_ORIGINS")
 if env_origins:
-    origins.extend(env_origins.split(","))
-
+    if env_origins == "*":
+        # Егер Render-де жұлдызша тұрса, оны елемейміз (қате шықпауы үшін)
+        pass 
+    else:
+        origins.extend(env_origins.split(","))
 # 3. Middleware-ді дұрыс баптаймыз
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,    # <--- Жұлдызша емес, 'origins' тізімін береміз!
-    allow_credentials=True,
+    allow_origins=origins,      # <--- Мұнда ["*"] емес, нақты тізім тұруы шарт!
+    allow_credentials=True,     # <--- Бұл True болса, allow_origins-те "*" болмауы керек
     allow_methods=["*"],
     allow_headers=["*"],
 )
