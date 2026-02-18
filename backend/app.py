@@ -207,56 +207,81 @@ async def login_for_access_token(
 @app.on_event("startup")
 async def startup_event():
     global redis_pool
-    logger.info("🚀 Запуск приложения...")
+    logger.info("🚀 1. БАСТАЛДЫ: Запуск приложения...")
+    
     try:
+        # 1. Database
+        logger.info("⏳ 2. Database қосылуда...")
         app.state.db = Database()
         app.state.db.initialize()
-        #app.state.detector = FakeNewsDetector()
-        app.state.searcher = None
-        logger.info("✅ DB и детектор готовы.")
-        app.state.searcher = WebSearcher()
+        logger.info("✅ 3. Database қосылды!")
 
+        # 2. Searcher
+        logger.info("⏳ 4. Searcher қосылуда...")
+        app.state.searcher = WebSearcher()
+        logger.info("✅ 5. Searcher дайын!")
+
+        # 3. Gemini
+        logger.info("⏳ 6. Gemini API тексерілуде...")
         GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
         if not GEMINI_API_KEY:
             raise ValueError("❌ GEMINI_API_KEY не найден!")
         genai.configure(api_key=GEMINI_API_KEY)
-
+        
         TEXT_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
         text_conf = {"temperature": 0.3, "response_mime_type": "application/json"}
         app.state.gemini_model = genai.GenerativeModel(TEXT_MODEL, generation_config=text_conf)
-
+        
+        # Vision Model setup...
         vision_conf = {"temperature": 0.4}
         app.state.gemini_vision_model = genai.GenerativeModel(TEXT_MODEL, generation_config=vision_conf)
-
+        
+        # Fallback Model setup...
         FALLBACK_MODEL = "gemini-pro-latest"
         fallback_conf = {"temperature": 0.45, "response_mime_type": "application/json"}
         app.state.gemini_fallback_model = genai.GenerativeModel(FALLBACK_MODEL, generation_config=fallback_conf)
-        logger.info(f"✅ Gemini Vision модели инициализированы: {TEXT_MODEL} / fallback {FALLBACK_MODEL}")
+        logger.info("✅ 7. Gemini дайын!")
 
+        # 4. Secret Key
         SECRET_KEY = os.getenv("SECRET_KEY")
         if not SECRET_KEY:
             raise ValueError("❌ SECRET_KEY не найден!")
         app.state.secret_key = SECRET_KEY
 
+        # 5. Redis
+        logger.info("⏳ 8. Redis қосылуда...")
         redis_url = os.getenv("REDIS_URL")
-        try:
-            redis_pool = redis.ConnectionPool.from_url(redis_url, decode_responses=True) if redis_url else \
-                redis.ConnectionPool(host=os.getenv("REDIS_HOST", "localhost"),
-                                     port=int(os.getenv("REDIS_PORT", 6379)),
-                                     password=os.getenv("REDIS_PASSWORD") or None,
-                                     db=int(os.getenv("REDIS_DB", 0)),
-                                     decode_responses=True)
-            redis.Redis(connection_pool=redis_pool).ping()
-            logger.info("✅ Redis подключен.")
-        except Exception as re:
-            logger.error(f"Redis ошибка: {re}")
+        
+        if redis_url:
+            # Тырнақшаларды алып тастау үшін тазалау
+            redis_url = redis_url.replace('"', '').strip()
+            
+            # Timeout қосамыз (Егер 5 секунд жауап бермесе, күтпейміз)
+            redis_pool = redis.ConnectionPool.from_url(
+                redis_url, 
+                decode_responses=True,
+                socket_timeout=5.0,  # <--- МАҢЫЗДЫ: 5 секундтан артық күтпеу
+                socket_connect_timeout=5.0
+            )
+            
+            try:
+                # Тексеру (Ping)
+                r = redis.Redis(connection_pool=redis_pool)
+                r.ping()
+                logger.info("✅ 9. Redis сәтті қосылды!")
+            except Exception as re:
+                logger.error(f"⚠️ Redis қатесі (бірақ сервер қосыла береді): {re}")
+                redis_pool = None
+        else:
+            logger.warning("⚠️ REDIS_URL жоқ, Redis қосылмайды.")
             redis_pool = None
 
     except Exception as e:
-        logger.error(f"❌ Startup ошибка: {e}", exc_info=True)
-        app.state.db = app.state.detector = app.state.searcher = None
-        app.state.gemini_model = app.state.gemini_vision_model = app.state.gemini_fallback_model = None
-        redis_pool = None
+        logger.error(f"❌ Startup ішінде КРИТИКАЛЫҚ ҚАТЕ: {e}", exc_info=True)
+        # Қате болса да сервер құламауы үшін (debug үшін):
+        # app.state.db = None
+        # raise e  <-- Мұны алып тастасақ, сервер бәрібір қосылады (қатені көру үшін)
+        raise e
 
 
 # === 5. Helpers ===
