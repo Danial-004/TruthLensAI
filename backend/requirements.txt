@@ -28,4 +28,4 @@ redis
 feedparser
 schedule
 google-generativeai
-PIL
+Pillow
