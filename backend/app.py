@@ -424,25 +424,27 @@ async def analyze_image(
     current_user: Optional[dict] = Depends(get_optional_current_user),
     _guest_limit_check: None = Depends(rate_limit_guest)
 ):
+    # 1. Модельдерді алу (Егер vision_model бөлек жоқ болса, негізгі gemini_model-ді аламыз)
     primary_vision_model = getattr(request.app.state, "gemini_vision_model", None)
+    if not primary_vision_model:
+        primary_vision_model = getattr(request.app.state, "gemini_model", None) # Fallback to main model
+
     fallback_vision_model = getattr(request.app.state, "gemini_fallback_model", None)
     db: Optional[Database] = getattr(request.app.state, "db", None)
-    if not db or not (primary_vision_model or fallback_vision_model):
+    
+    # Тек primary (негізгі) модель болса да жетеді
+    if not db or not primary_vision_model:
         raise HTTPException(503, "Vision сервис недоступен")
 
-    user_id_for_db = None # ✅ Добавлено для сохранения истории
+    user_id_for_db = None
     if current_user:
         user_id = current_user.get('id')
         if not user_id: raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Ошибка ID пользователя.")
-        # Лимит для пользователя проверяется внутри check_and_update_rate_limit, вызываемого из /analyze
-        # Здесь нам нужен только user_id для сохранения
         user_id_for_db = user_id
         logger.info(f"Анализ (Image Upload) для: {current_user.get('email')}")
     else:
-        # Гостевой лимит проверяется через _guest_limit_check
-         ip_guest = request.headers.get("X-Forwarded-For") or request.headers.get("X-Real-IP") or request.client.host
-         logger.info(f"Анализ (Image Upload) для гостя: {ip_guest or 'unknown'}")
-
+        ip_guest = request.headers.get("X-Forwarded-For") or request.headers.get("X-Real-IP") or request.client.host
+        logger.info(f"Анализ (Image Upload) для гостя: {ip_guest or 'unknown'}")
 
     try:
         img_bytes = await file.read()
@@ -456,50 +458,64 @@ async def analyze_image(
         raise HTTPException(500, f"Ошибка обработки изображения: {e}")
         
     language_code = detect_language(text)
-    prompt = get_vision_analysis_prompt(language_code, text)
+    
+    # ✅ ТҮЗЕТУ: Уақыт контекстін қосамыз (2026 жыл)
+    current_date_str = datetime.now().strftime("%Y-%m-%d (%A)")
+    base_prompt = get_vision_analysis_prompt(language_code, text)
+    
+    # Промптты күшейтеміз:
+    prompt = f"""
+    [SYSTEM NOTE: IMPORTANT CONTEXT]
+    Today's Date: {current_date_str}. 
+    Current Year: 2026.
+    Treat "2026" as the current year for any visual analysis (calendars, dates on screens, etc.).
+    --------------------------------------------------
+    {base_prompt}
+    """
         
     analysis_data: Optional[GeminiVisionAnalysisInternal] = None
     last_exception: Optional[Exception] = None
-    model_used_name = primary_vision_model.model_name if primary_vision_model else 'N/A'
+    model_used_name = primary_vision_model.model_name if hasattr(primary_vision_model, 'model_name') else 'Gemini'
 
     try: # Блок Primary -> Fallback
-        if not primary_vision_model: raise RuntimeError("Primary vision model not loaded")
         logger.info(f"Попытка 1 (Image Upload): Вызов {model_used_name}...");
         for attempt in range(MAX_RETRIES_GEMINI): # Цикл перезапроса
             try: 
                 logger.info(f"...попытка {attempt + 1}"); 
                 response = await primary_vision_model.generate_content_async([prompt, image_part], generation_config={"response_mime_type": "application/json"})
                 
-                # ✅ ИСПРАВЛЕНИЕ: Добавлена обработка ошибки парсинга
                 try:
                     analysis_data = GeminiVisionAnalysisInternal.model_validate_json(response.text)
                     logger.info(f"...Успех парсинга JSON. V: {analysis_data.verdict}, C: {analysis_data.confidence:.2f}"); 
-                    break # Выходим из цикла ретраев если парсинг успешен
+                    break 
                 except (ValidationError, json.JSONDecodeError) as p_err:
                     last_exception = p_err
-                    logger.error(f"...НЕ УДАЛОСЬ (Парсинг JSON): {p_err}\nRaw response: {response.text}", exc_info=False) # Логируем RAW ответ
-                    if attempt == MAX_RETRIES_GEMINI - 1: raise p_err # Если последняя попытка - пробрасываем ошибку
-                    await asyncio.sleep(1) # Ждем перед следующей попыткой
-                    continue # Переходим к следующей попытке парсинга
+                    logger.error(f"...НЕ УДАЛОСЬ (Парсинг JSON): {p_err}\nRaw response: {response.text}", exc_info=False)
+                    if attempt == MAX_RETRIES_GEMINI - 1: raise p_err
+                    await asyncio.sleep(1)
+                    continue
 
             except Exception as api_err: 
                 last_exception = api_err
                 logger.error(f"...НЕ УДАЛОСЬ (API): {api_err}", exc_info=(attempt == MAX_RETRIES_GEMINI-1))
-                if attempt == MAX_RETRIES_GEMINI - 1: raise api_err # Пробрасываем ошибку API если последняя попытка
-                await asyncio.sleep(1) # Ждем перед следующей попыткой API
+                if attempt == MAX_RETRIES_GEMINI - 1: raise api_err
+                await asyncio.sleep(1)
         
         if analysis_data is None: raise last_exception if last_exception else RuntimeError(f"Primary model {model_used_name} failed after {MAX_RETRIES_GEMINI} attempts")
     
     except Exception as primary_error: # Если Primary модель совсем провалилась
         logger.error(f"Основная модель (Image Upload) {model_used_name} ПРОВАЛИЛАСЬ: {primary_error}. Эскалация!");
-        if not fallback_vision_model: logger.critical("Fallback (Image Upload) НЕдоступна!"); raise HTTPException(503, "Ошибка AI")
+        
+        # Егер Fallback модель жоқ болса, қате береміз
+        if not fallback_vision_model: 
+            # Fallback жоқ болса да, Primary қатесін клиентке түсінікті етіп береміз
+            raise HTTPException(500, "Ошибка обработки изображения AI.")
         
         model_used_name = fallback_vision_model.model_name
         try: 
             logger.info(f"Попытка 2 (Image Upload): Вызов Fallback {model_used_name}..."); 
             response = await fallback_vision_model.generate_content_async([prompt, image_part], generation_config={"response_mime_type": "application/json"})
             
-            # ✅ ИСПРАВЛЕНИЕ: Добавлена обработка ошибки парсинга для Fallback
             try:
                 analysis_data = GeminiVisionAnalysisInternal.model_validate_json(response.text)
                 logger.info(f"...Fallback Успех парсинга JSON. V: {analysis_data.verdict}, C: {analysis_data.confidence:.2f}"); 
@@ -511,16 +527,14 @@ async def analyze_image(
             logger.critical(f"Обе модели (Image Upload) провалились! Err1: {primary_error}, Err2: {fallback_error}", exc_info=True); 
             raise HTTPException(500, "Ошибка AI (Обе модели)")
 
-    # Возвращаем результат анализа ИЗОБРАЖЕНИЯ (ImageAnalysisResponse)
     if analysis_data:
         logger.info(f"Финальный ответ (Image Upload) через: {model_used_name}")
-        # ✅ Сохраняем историю для пользователя, если он есть
         response_to_save = {
             "verdict": analysis_data.verdict,
             "confidence": analysis_data.confidence,
             "explanation": analysis_data.explanation,
             "original_statement": text,
-            "analysis_type": "image_upload" # Добавим тип анализа
+            "analysis_type": "image_upload"
         }
         if user_id_for_db:
              db.save_analysis(
@@ -537,11 +551,7 @@ async def analyze_image(
 
 # === ✅✅✅ ОБЪЕДИНЕННЫЙ ЭНДПОИНТ: /analyze_url (v4.8 - Картинки + Статьи) === ✅✅✅
 # ИСПРАВЛЕННАЯ ВЕРСИЯ - Возвращает FullAnalysisResponse для HTML
-@app.post("/analyze_url", 
-          # Указываем Union для Swagger, но FastAPI может ругаться. 
-          # Главное, что мы возвращаем ПРАВИЛЬНУЮ СТРУКТУРУ ДАННЫХ.
-          # response_model=Union[FullAnalysisResponse, ImageAnalysisResponse], 
-          tags=["Analysis"]) 
+@app.post("/analyze_url", response_model=FullAnalysisResponse, tags=["Analysis"])
 async def analyze_url(
     request: Request,
     body: UrlAnalysisRequest,
@@ -549,32 +559,41 @@ async def analyze_url(
     _guest_limit_check: None = Depends(rate_limit_guest)
 ):
     """
-    Анализирует контент по URL (v4.8):
-    - Если URL ведет на ИЗОБРАЖЕНИЕ -> использует Vision модель (возвращает ImageAnalysisResponse).
-    - Если URL ведет на HTML -> извлекает текст и использует Text модель (возвращает FullAnalysisResponse).
+    Анализирует контент по URL (v5.0 - Gemini Only + 2026 Context):
+    - Если URL ведет на ИЗОБРАЖЕНИЕ -> использует Vision модель.
+    - Если URL ведет на HTML -> извлекает текст и использует Text модель.
     """
+    # 1. Тек қажетті компоненттерді аламыз (Detector керек емес)
     primary_vision_model = getattr(request.app.state, "gemini_vision_model", None)
+    # Егер бөлек vision моделі жоқ болса, негізгісін қолданамыз
+    if not primary_vision_model:
+        primary_vision_model = getattr(request.app.state, "gemini_model", None)
+
     fallback_vision_model = getattr(request.app.state, "gemini_fallback_model", None)
     text_model = getattr(request.app.state, "gemini_model", None)
-    detector = getattr(request.app.state, "detector", None)      
     searcher = getattr(request.app.state, "searcher", None)      
     db: Optional[Database] = getattr(request.app.state, "db", None)
 
-    if not db or not detector or not searcher or not text_model or not (primary_vision_model or fallback_vision_model):
+    if not db or not text_model:
         raise HTTPException(503, "Сервис анализа временно недоступен")
 
-    user_id_for_db = None # ✅ Добавлено для сохранения истории
+    user_id_for_db = None
     if current_user:
         user_id = current_user.get('id')
         if not user_id: raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Ошибка ID пользователя.")
-        if not db.check_and_update_rate_limit(user_id=user_id, limit=USER_DAILY_REQUEST_LIMIT):
-             raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Дневной лимит запросов исчерпан.")
-        user_id_for_db = user_id # ✅ Сохраняем ID для истории
+        # Лимитті тексеру
+        try:
+             if not db.check_and_update_rate_limit(user_id=user_id, limit=USER_DAILY_REQUEST_LIMIT):
+                  raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Дневной лимит запросов исчерпан.")
+        except:
+             pass 
+        user_id_for_db = user_id
         logger.info(f"Анализ (URL) для: {current_user.get('email')}")
     else:
         ip_guest = request.headers.get("X-Forwarded-For") or request.headers.get("X-Real-IP") or request.client.host
         logger.info(f"Анализ (URL) для гостя: {ip_guest or 'unknown'}")
 
+    # 2. Контентті жүктеу
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=URL_DOWNLOAD_TIMEOUT) as client:
             logger.info(f"Скачивание контента с URL: {body.url}")
@@ -583,188 +602,137 @@ async def analyze_url(
             response.raise_for_status()
             content_type = response.headers.get("content-type", "").lower()
             content = await response.aread()
-    except httpx.HTTPStatusError as e: logger.error(f"Ошибка скачивания URL (HTTP {e.response.status_code}): {body.url}", exc_info=False); raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Не удалось скачать: Ошибка {e.response.status_code}")
-    except httpx.RequestError as e: logger.error(f"Ошибка скачивания URL (Network): {body.url}", exc_info=False); raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Не удалось подключиться к URL: {e}")
-    except Exception as e: logger.error(f"Неизвестная ошибка скачивания URL: {body.url}", exc_info=True); raise HTTPException(500, f"Ошибка при скачивании URL: {e}")
+    except Exception as e:
+        logger.error(f"Ошибка скачивания URL: {body.url} - {e}")
+        raise HTTPException(400, f"Не удалось скачать контент: {str(e)}")
+
+    # 3. Уақыт контексті (2026 жыл)
+    current_date_str = datetime.now().strftime("%Y-%m-%d (%A)")
 
     # === СЛУЧАЙ 1: ЭТО ИЗОБРАЖЕНИЕ ===
     if content_type.startswith("image/"):
         logger.info(f"Обнаружено ИЗОБРАЖЕНИЕ (Type: {content_type}). Запуск Vision анализа...")
+        
         try:
             img = Image.open(io.BytesIO(content))
             if img.mode == "RGBA": img = img.convert("RGB")
             img.thumbnail((2048, 2048)); buf = io.BytesIO()
             img.save(buf, format="JPEG"); image_part = {"mime_type": "image/jpeg", "data": buf.getvalue()}
-            logger.info(f"Изображение по URL обработано ({(len(image_part['data'])/1024):.1f} KB)")
-        except Exception as e: logger.error(f"Ошибка обработки изображения с URL: {body.url}", exc_info=True); raise HTTPException(500, f"Ошибка обработки файла с URL: {e}")
+        except Exception as e: 
+            raise HTTPException(500, f"Ошибка обработки файла с URL: {e}")
 
         language_code = detect_language(body.text)
-        prompt = get_vision_analysis_prompt(language_code, body.text)
-        logger.info(f"Язык запроса/ответа (URL-Image): {language_code}")
-
-        analysis_data: Optional[GeminiVisionAnalysisInternal] = None
-        last_exception: Optional[Exception] = None
-        model_used_name = primary_vision_model.model_name if primary_vision_model else 'N/A'
         
-        try: # Блок Primary -> Fallback
-            if not primary_vision_model: raise RuntimeError("Primary vision model not loaded")
-            logger.info(f"Попытка 1 (URL-Image): Вызов {model_used_name}...");
-            for attempt in range(MAX_RETRIES_GEMINI): # Цикл перезапроса
-                try: 
-                    logger.info(f"...попытка {attempt + 1}"); 
-                    response = await primary_vision_model.generate_content_async([prompt, image_part], generation_config={"response_mime_type": "application/json"})
-                    
-                    # ✅ ИСПРАВЛЕНИЕ: Добавлена обработка ошибки парсинга
-                    try:
-                        analysis_data = GeminiVisionAnalysisInternal.model_validate_json(response.text)
-                        logger.info(f"...Успех парсинга JSON. V: {analysis_data.verdict}, C: {analysis_data.confidence:.2f}"); 
-                        break # Выходим из цикла ретраев если парсинг успешен
-                    except (ValidationError, json.JSONDecodeError) as p_err:
-                        last_exception = p_err
-                        logger.error(f"...НЕ УДАЛОСЬ (Парсинг JSON): {p_err}\nRaw response: {response.text}", exc_info=False) # Логируем RAW ответ
-                        if attempt == MAX_RETRIES_GEMINI - 1: raise p_err # Если последняя попытка - пробрасываем ошибку
-                        await asyncio.sleep(1) # Ждем перед следующей попыткой
-                        continue # Переходим к следующей попытке парсинга
+        # Промпт (Vision + 2026)
+        base_prompt = get_vision_analysis_prompt(language_code, body.text)
+        prompt = f"""
+        [SYSTEM NOTE]
+        Today's Date: {current_date_str}. Current Year: 2026.
+        Treat "2026" as the current year.
+        -------------------
+        {base_prompt}
+        """
 
-                except Exception as api_err: 
-                    last_exception = api_err
-                    logger.error(f"...НЕ УДАЛОСЬ (API): {api_err}", exc_info=(attempt == MAX_RETRIES_GEMINI-1))
-                    if attempt == MAX_RETRIES_GEMINI - 1: raise api_err # Пробрасываем ошибку API если последняя попытка
-                    await asyncio.sleep(1) # Ждем перед следующей попыткой API
-            
-            if analysis_data is None: raise last_exception if last_exception else RuntimeError(f"Primary model {model_used_name} failed after {MAX_RETRIES_GEMINI} attempts")
-        
-        except Exception as primary_error: # Если Primary модель совсем провалилась
-            logger.error(f"Основная модель (URL-Image) {model_used_name} ПРОВАЛИЛАСЬ: {primary_error}. Эскалация!");
-            if not fallback_vision_model: logger.critical("Fallback (URL-Image) НЕдоступна!"); raise HTTPException(503, "Ошибка AI")
-            
-            model_used_name = fallback_vision_model.model_name
-            try: 
-                logger.info(f"Попытка 2 (URL-Image): Вызов Fallback {model_used_name}..."); 
-                response = await fallback_vision_model.generate_content_async([prompt, image_part], generation_config={"response_mime_type": "application/json"})
-                
-                # ✅ ИСПРАВЛЕНИЕ: Добавлена обработка ошибки парсинга для Fallback
-                try:
-                    analysis_data = GeminiVisionAnalysisInternal.model_validate_json(response.text)
-                    logger.info(f"...Fallback Успех парсинга JSON. V: {analysis_data.verdict}, C: {analysis_data.confidence:.2f}"); 
-                except (ValidationError, json.JSONDecodeError) as p_err_fb:
-                     logger.critical(f"Fallback (URL-Image) НЕ СМОГ распарсить JSON! Err: {p_err_fb}\nRaw response: {response.text}", exc_info=True)
-                     raise HTTPException(500, "Ошибка AI (Fallback JSON)")
-
-            except Exception as fallback_error: 
-                logger.critical(f"Обе модели (URL-Image) провалились! Err1: {primary_error}, Err2: {fallback_error}", exc_info=True); 
-                raise HTTPException(500, "Ошибка AI (Обе модели)")
-
-        # Возвращаем результат анализа ИЗОБРАЖЕНИЯ (ImageAnalysisResponse)
-        if analysis_data:
-            logger.info(f"Финальный ответ (URL-Image) через: {model_used_name}")
-            # ✅ Сохраняем историю для пользователя, если он есть
-            response_to_save = {
-                "verdict": analysis_data.verdict,
-                "confidence": analysis_data.confidence,
-                "explanation": analysis_data.explanation,
-                "original_statement": body.text,
-                "analysis_type": "image_url" # Добавим тип анализа
-            }
-            if user_id_for_db:
-                 db.save_analysis(
-                    user_id=user_id_for_db, text=f"Image URL: {body.url} | Claim: {body.text}", 
-                    verdict=analysis_data.verdict, confidence=analysis_data.confidence, 
-                    full_response=response_to_save
-                )
-            
-            return ImageAnalysisResponse(**response_to_save)
-        else: 
-            # Эта ветка не должна достигаться из-за raise выше, но на всякий случай
-            logger.error("Неизвестная ошибка (URL-Image) - analysis_data is None.")
-            raise HTTPException(500, "Неизвестная ошибка AI.")
-
-    # === СЛУЧАЙ 2: ЭТО HTML СТРАНИЦА ===
-    elif content_type.startswith("text/html"):
-        logger.info(f"Обнаружен HTML (Type: {content_type}). Запуск Text анализа...")
+        # Gemini шақыру
         try:
+            # Негізгі модель
+            vision_resp = await primary_vision_model.generate_content_async([prompt, image_part], generation_config={"response_mime_type": "application/json"})
+        except Exception:
+            # Fallback модель (егер бар болса)
+            if fallback_vision_model:
+                 vision_resp = await fallback_vision_model.generate_content_async([prompt, image_part], generation_config={"response_mime_type": "application/json"})
+            else:
+                 raise HTTPException(503, "AI Vision сервис недоступен.")
+
+        # JSON Parse
+        try:
+            analysis_data = GeminiVisionAnalysisInternal.model_validate_json(vision_resp.text)
+        except Exception as e:
+            logger.error(f"JSON Vision Error: {e}")
+            raise HTTPException(500, "Ошибка AI при анализе изображения.")
+
+        # Нәтиже жинау
+        response_data = {
+            "verdict": analysis_data.verdict,
+            "confidence": analysis_data.confidence,
+            "original_statement": f"Image URL: {body.url}",
+            "local_label": None,
+            "detailed_explanation": analysis_data.explanation,
+            "bias_identification": "Visual Analysis",
+            "search_suggestions": [],
+            "sources": []
+        }
+
+    # === СЛУЧАЙ 2: ЭТО HTML СТРАНИЦА (TEXT) ===
+    else:
+        logger.info(f"Обнаружен HTML/Text. Запуск Text анализа...")
+        try:
+            # HTML тазалау
             html_text = content.decode(response.encoding or 'utf-8')
             soup = BeautifulSoup(html_text, "html.parser")
-            main_content = soup.find("article") or soup.find("main") or \
-                           soup.find("div", class_=lambda x: x and 'article' in x.lower()) or \
-                           soup.find("div", id=lambda x: x and 'content' in x.lower()) or \
-                           soup.body
-            article_text = main_content.get_text(separator="\n", strip=True) if main_content else soup.get_text(separator="\n", strip=True)
-
-            if not article_text or len(article_text) < 50: # Уменьшил порог
-                logger.warning(f"Не удалось извлечь достаточно текста из HTML ({len(article_text)} chars). URL: {body.url}")
-                # Можно или падать, или пытаться анализировать только user claim
-                # Попробуем анализировать только claim + URL
-                article_text = "Контент страницы не удалось извлечь."
-                # raise ValueError("Не удалось извлечь достаточно текста из HTML.")
-            
-            logger.info(f"Извлечено {len(article_text)} символов текста из HTML.")
-            text_to_analyze = body.text
-            sources_for_prompt_url = f"- Title: Веб-страница\n  URL: {url_str}\n  Description: {article_text[:1500]}..."
-
+            # Негізгі тексті алу
+            for script in soup(["script", "style"]): script.extract()
+            article_text = soup.get_text(separator="\n", strip=True)[:5000] # Лимит 5000
         except Exception as e:
-            logger.error(f"Ошибка парсинга HTML или извлечения текста: {e}", exc_info=True)
-            raise HTTPException(400, f"Не удалось извлечь текст статьи: {e}")
+             raise HTTPException(400, f"Не удалось извлечь текст: {e}")
 
-        language = detect_language(text_to_analyze)
-        local_recommendation = None
-        # ... (логика для local_recommendation остается) ...
-        if language == 'kk':
-             try:
-                 clean_article_text = preprocess_text(article_text if len(article_text) > 50 else text_to_analyze) # Берем текст статьи если есть, иначе claim
-                 prediction = detector.predict(clean_article_text, language)
-                 if prediction['classification'] in ['real', 'fake']: local_recommendation = prediction['classification']
-                 logger.info(f"Локальная 'kk' модель (URL-Text) РЕКОМЕНДУЕТ: {local_recommendation}")
-             except Exception as e: logger.error(f"Ошибка 'kk' модели (URL-Text): {e}")
+        if len(article_text) < 50:
+             article_text = "Content extraction failed. Analyze based on URL only."
 
-        logger.info("Вызов Gemini Text (URL-Text)...")
-        final_prompt = get_gemini_full_analysis_prompt(
+        text_to_analyze = f"Claim: {body.text}\n\nURL Content: {article_text}"
+        language = detect_language(body.text) # Сұрақтың тілі маңыздырақ
+
+        # Промпт (Text + 2026)
+        base_prompt = get_gemini_full_analysis_prompt(
             language=language,
-            text=text_to_analyze,
-            sources_text=sources_for_prompt_url,
-            local_model_recommendation=local_recommendation
+            text=body.text, # User claim
+            sources_text=f"Source URL Content:\n{article_text[:2000]}...", # Контентті дереккөз ретінде береміз
+            local_model_recommendation=None
         )
+
+        final_prompt = f"""
+        [SYSTEM NOTE]
+        Today's Date: {current_date_str}. Current Year: 2026.
+        Treat "2026" as the current year.
+        -------------------
+        {base_prompt}
+        """
+
+        # Gemini шақыру
         try:
             response_gemini = await text_model.generate_content_async(final_prompt)
-            # ✅ ИСПРАВЛЕНИЕ: Добавлена обработка ошибки парсинга
-            try:
-                gemini_full_response = GeminiFullAnalysisResponse.model_validate_json(response_gemini.text)
-            except (ValidationError, json.JSONDecodeError) as p_err_txt:
-                 logger.error(f"НЕ УДАЛОСЬ (Парсинг JSON Text): {p_err_txt}\nRaw response: {response_gemini.text}", exc_info=False)
-                 raise HTTPException(500, "Ошибка AI (Text JSON)")
-                 
-            analysis_data_dict = gemini_full_response.model_dump()
-            final_verdict = analysis_data_dict.pop("verdict")
-            final_confidence = analysis_data_dict.pop("confidence")
-            logger.info(f"Gemini Text (URL-Text) Успех. Вердикт: {final_verdict}")
-
-            # ✅✅✅ ИСПРАВЛЕНИЕ: Возвращаем СЛОВАРЬ в формате FullAnalysisResponse ✅✅✅
-            response_data = {
-                "verdict": final_verdict,
-                "confidence": final_confidence,
-                "original_statement": body.text,
-                **analysis_data_dict # Добавляем bias_identification, detailed_explanation, sources, search_suggestions
-            }
-
-# ... (db.save_analysis басы) ...
-            analysis_id = None
-            if user_id_for_db:
-                analysis_id = db.save_analysis(
-                    user_id=user_id_for_db, 
-                    text=f"URL: {body.url} | Claim: {body.text}", 
-                    verdict=final_verdict.value, 
-                    confidence=final_confidence, 
-                    full_response=response_data # Бұл жол түсіп қалған болуы мүмкін
-                ) # ✅ 1. Жақшаны жабамыз
-                response_data["analysis_id"] = analysis_id
+            gemini_full = GeminiFullAnalysisResponse.model_validate_json(response_gemini.text)
+            analysis_dict = gemini_full.model_dump()
             
-            return FullAnalysisResponse(**response_data) # немесе LinkAnalysisResponse (функцияға байланысты)
-
-        except HTTPException as http_exc:
-            raise http_exc
+            verdict = analysis_dict.pop("verdict")
+            confidence = analysis_dict.pop("confidence")
+            
+            response_data = {
+                "verdict": verdict,
+                "confidence": confidence,
+                "original_statement": body.text,
+                "local_label": None,
+                **analysis_dict
+            }
         except Exception as e:
-            logger.error(f"Error: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Internal Error")
+            logger.error(f"Text Analysis Error: {e}")
+            raise HTTPException(500, "Ошибка AI при анализе текста.")
+
+    # 4. Базаға сақтау (Ортақ логика)
+    if user_id_for_db:
+        try:
+            db.save_analysis(
+                user_id=user_id_for_db, 
+                text=f"URL: {body.url} | {body.text}", 
+                verdict=response_data['verdict'], # Enum value емес, string болуы мүмкін, тексеру керек
+                confidence=response_data['confidence'], 
+                full_response=response_data
+            )
+        except Exception as db_e:
+            logger.error(f"DB Save Error: {db_e}")
+            # База қатесі анализді тоқтатпауы керек
+
+    return FullAnalysisResponse(**response_data)
 
 
 # ✅ 2. Prompt функциясы бөлек тұруы керек (Indentation дұрыс болуы шарт)
