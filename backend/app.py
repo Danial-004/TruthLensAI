@@ -30,6 +30,7 @@ from bs4 import BeautifulSoup
 from database import Database   
 from search_api import WebSearcher
 from utils import detect_language, preprocess_text
+from datetime import datetime
 
 # Токен 30 минутқа жарамды болады
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
@@ -869,33 +870,48 @@ async def analyze_text(
         # Оның орнына Gemini-ге "None" жібереміз.
 
         logger.info("Вызов Gemini (Chief Fact-Checker)...")
-        
-        # Prompt дайындау
-        final_prompt = get_gemini_full_analysis_prompt(
+
+        # 1. Қазіргі уақытты анықтаймыз (2026 жыл проблемасын шешу үшін)
+        current_date_str = datetime.now().strftime("%Y-%m-%d (%A)")
+
+        # 2. Негізгі промптты аламыз
+        base_prompt = get_gemini_full_analysis_prompt(
             language=language,
             text=req_body.text,
             sources_text=sources_for_prompt,
-            local_model_recommendation=None # Жергілікті модель ЖОҚ
+            local_model_recommendation=None # Жергілікті модельді өшірдік
         )
+
+        # 3. Промптқа "Бүгін 2026 жыл" деп жалғаймыз
+        final_prompt = f"""
+        [SYSTEM NOTE: IMPORTANT CONTEXT]
+        Today's Date: {current_date_str}. 
+        Current Year: 2026.
+        Any news or events dated {current_date_str} or earlier are PAST or PRESENT facts, not future predictions.
+        Treat "2026" as the current year.
+        --------------------------------------------------
+        {base_prompt}
+        """
         
-        # Gemini-ді шақыру
+        # 4. Gemini-ді шақырамыз
         response_gemini = await gemini_model.generate_content_async(final_prompt)
         
         try:
-            # Жауапты өңдеу
+            # 5. Жауапты өңдеу (Parsing)
             gemini_full_response = GeminiFullAnalysisResponse.model_validate_json(response_gemini.text)
             analysis_data_dict = gemini_full_response.model_dump()
             final_verdict = analysis_data_dict.pop("verdict")
             final_confidence = analysis_data_dict.pop("confidence")
         except Exception as json_e:
             logger.error(f"❌ JSON Error: {json_e}")
-            raise HTTPException(status_code=500, detail="Ошибка AI.")
+            raise HTTPException(status_code=500, detail="Ошибка AI (JSON Parse).")
 
+        # 6. Нәтижені жинақтау
         response_data = {
             "verdict": final_verdict, 
             "confidence": final_confidence,
             "original_statement": req_body.text, 
-            "local_label": None, # Frontend күтсе, бос жібереміз
+            "local_label": None, 
             **analysis_data_dict
         }
 
