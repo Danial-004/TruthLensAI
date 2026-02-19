@@ -410,6 +410,7 @@ def get_vision_analysis_prompt(language_code: str, text_prompt: str) -> str:
     * Оцени свою **общую уверенность** в вердикте от 0.0 до 1.0. Будь честен: если есть сомнения, уверенность не должна быть 1.0.
 
 Твой ответ ДОЛЖЕН быть в строгом JSON-формате ({schema_json}) на {output_language_name} языке. Не добавляй никакого текста до или после JSON.
+Do NOT return the JSON schema or 'properties' key. Return ONLY the raw JSON data matching the structure.
 """
     return prompt
 
